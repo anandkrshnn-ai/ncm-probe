@@ -1,6 +1,18 @@
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+# Search for NCM directory (e.g. /content/NCM in Colab or adjacent to repo)
+for candidate in [
+    Path("/content/NCM"),
+    REPO_ROOT.parent / "NCM",
+    REPO_ROOT.parent / "ncm",
+    Path.cwd() / "NCM",
+    Path.cwd() / "ncm",
+]:
+    if candidate.exists() and str(candidate) not in sys.path:
+        sys.path.insert(0, str(candidate))
 
 # TODO: fork HazyResearch/NCM, apply stop_level upstream, pin to fork + commit before full sweep.
 

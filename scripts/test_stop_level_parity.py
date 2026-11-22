@@ -23,9 +23,20 @@ import torch
 from omegaconf import OmegaConf
 from huggingface_hub import hf_hub_download
 
-# Add repo root to path
+# Add repo root and common NCM clone locations to path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
+
+# Search for NCM directory (e.g. /content/NCM in Colab or adjacent to repo)
+for candidate in [
+    Path("/content/NCM"),
+    REPO_ROOT.parent / "NCM",
+    REPO_ROOT.parent / "ncm",
+    Path.cwd() / "NCM",
+    Path.cwd() / "ncm",
+]:
+    if candidate.exists() and str(candidate) not in sys.path:
+        sys.path.insert(0, str(candidate))
 
 # Fixed real XSum example paragraph (source: BBC News / XSum test split sample)
 FIXED_XSUM_DOC = (
