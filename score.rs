@@ -225,6 +225,13 @@ pub fn score_file(path: &Path) -> Result<ScoreReport, Box<dyn std::error::Error>
     let reader = BufReader::new(file);
 
     let mut report = ScoreReport::default();
+    // Initialize all canonical classification keys with 0 to prevent downstream KeyError
+    report.classification_breakdown.insert("success".to_string(), 0);
+    report.classification_breakdown.insert("tokenizer_failure".to_string(), 0);
+    report.classification_breakdown.insert("decoder_failure".to_string(), 0);
+    report.classification_breakdown.insert("over_trigger".to_string(), 0);
+    report.classification_breakdown.insert("rare_case".to_string(), 0);
+
     let mut total_success = 0;
 
     for (line_idx, line) in reader.lines().enumerate() {
