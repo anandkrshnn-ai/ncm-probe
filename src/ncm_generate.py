@@ -1,34 +1,102 @@
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# TODO: fork HazyResearch/NCM, apply stop_level upstream, pin to fork + commit before full sweep.
+
 """
 Stage 1: NCM Skeleton Generation.
-For each row, for wrapper_variant in {answer, passage, bare}, for level_k in {2, 3},
-generates NCM skeleton text.
-Output: logs/skeletons.jsonl.
-Halts and asks if NCM_XSUM_REPO is unset or ambiguous.
-Supports --skeletons-in PATH to skip GPU work and directly pass existing skeletons.
-Supports --limit N and resumability.
+Generates early hierarchy coarse concept skeletons using frozen NCM (HazyResearch).
+Applies a surgical monkeypatch to NextConceptTransformer.generate() adding stop_level.
 """
 
 import argparse
+import inspect
 import json
 import os
 import shutil
 import sys
 from pathlib import Path
 
+import torch
 from src.config import NCM_XSUM_REPO, check_env_for_stage
 from src.load_seed import validate_seed
 
 WRAPPER_VARIANTS = ["answer", "passage", "bare"]
 LEVEL_KEYS = [2, 3]
 
-# Global cache for loaded model and tokenizer on Replit/GPU
 _LOADED_NCM = None
+
+
+def patch_next_concept_generate(orig_generate_fn):
+    """
+    Surgically applies the four-line diff to NextConceptTransformer.generate():
+    1. Signature accepts stop_level=None
+    2. Computes last = len(self.levels) - 1 if stop_level is None else stop_level
+    3. Iterates for level_idx in range(last)
+    4. Removes reassignment inside if return_latent
+    """
+    import functools
+
+    # Obtain exact source of orig_generate_fn
+    lines, start_line = inspect.getsourcelines(orig_generate_fn)
+    source = "".join(lines)
+
+    # 1. Signature edit
+    patched_source = source.replace(
+        "return_latent=False):",
+        "return_latent=False, stop_level=None):"
+    )
+
+    # 2. Add last definition right after docstring
+    doc_end = '"""\n'
+    idx_doc = patched_source.find(doc_end)
+    if idx_doc != -1:
+        insert_pos = idx_doc + len(doc_end)
+        insertion = (
+            "        last = len(self.levels) - 1 if stop_level is None else stop_level\n"
+            "        if not 0 <= last < len(self.levels):\n"
+            "            raise ValueError(f\"stop_level out of range: {last}\")\n"
+        )
+        patched_source = patched_source[:insert_pos] + insertion + patched_source[insert_pos:]
+
+    # 3. Sampling loop: range(len(self.levels)-1) -> range(last)
+    patched_source = patched_source.replace(
+        "for level_idx in range(len(self.levels)-1):",
+        "for level_idx in range(last):"
+    )
+    patched_source = patched_source.replace(
+        "for level_idx in range(len(self.levels) - 1):",
+        "for level_idx in range(last):"
+    )
+
+    # 4. Remove reassignment inside if return_latent:
+    # "last = len(self.levels) - 1\n"
+    patched_source = patched_source.replace(
+        "last = len(self.levels) - 1\n",
+        "# last retained from stop_level\n"
+    )
+
+    # Compile the patched function with the original closure and globals
+    fn_globals = orig_generate_fn.__globals__
+    exec_scope = {}
+    exec(patched_source, fn_globals, exec_scope)
+    patched_fn = exec_scope["generate"]
+    return functools.wraps(orig_generate_fn)(patched_fn)
+
+
+# Apply monkeypatch at import time if models.next_concept is available
+try:
+    from models.next_concept import NextConceptTransformer
+    NextConceptTransformer.generate = patch_next_concept_generate(NextConceptTransformer.generate)
+except Exception:
+    # Environment without HazyResearch/ncm installed yet (e.g. authoring environment)
+    pass
+
 
 def make_composite_key(row_id: str, wrapper_variant: str, level_k: int) -> str:
     return f"{row_id}__{wrapper_variant}__{level_k}"
+
 
 def format_prompt(question: str, wrapper_variant: str) -> str:
     if wrapper_variant == "answer":
@@ -38,138 +106,98 @@ def format_prompt(question: str, wrapper_variant: str) -> str:
     else:  # bare
         return question
 
+
 def get_ncm_generator(repo_id: str):
     """
-    Loads or initializes the Next-Concept Model (NCM) and tokenizer from Hugging Face checkpoint.
-    Supports official HazyResearch NCM modules (NextConceptTransformer, VQVAETokenizer)
-    or direct PyTorch state dicts.
+    Loads VQVAETokenizer and NextConceptTransformer per eval_shard.py:48-59.
     """
     global _LOADED_NCM
     if _LOADED_NCM is not None:
         return _LOADED_NCM
 
     try:
-        import torch
-        from huggingface_hub import hf_hub_download
         from omegaconf import OmegaConf
-    except ImportError as e:
-        raise ImportError(
-            f"Required dependency missing for live NCM inference ({e}).\n"
-            "Please ensure torch, huggingface_hub, and omegaconf are installed on the execution environment."
-        )
-
-    print(f"Loading NCM checkpoints from Hugging Face repository: {repo_id}...")
-
-    # Download checkpoints (XSum checkpoint pair: tokenizer.pt, generator.pt, config.yaml)
-    subfolder = "xsum" if "checkpoints" in repo_id.lower() else None
-    try:
-        config_path = hf_hub_download(repo_id=repo_id, filename="config.yaml", subfolder=subfolder)
-        tokenizer_path = hf_hub_download(repo_id=repo_id, filename="tokenizer.pt", subfolder=subfolder)
-        generator_path = hf_hub_download(repo_id=repo_id, filename="generator.pt", subfolder=subfolder)
-    except Exception as e:
-        # Fallback to direct root path if subfolder is not present
-        config_path = hf_hub_download(repo_id=repo_id, filename="config.yaml")
-        tokenizer_path = hf_hub_download(repo_id=repo_id, filename="tokenizer.pt")
-        generator_path = hf_hub_download(repo_id=repo_id, filename="generator.pt")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Initialized NCM weights on device: {device}")
-
-    cfg = OmegaConf.load(config_path)
-
-    # Instantiate official NCM architecture if HazyResearch/ncm package is installed on the machine
-    model = None
-    tokenizer = None
-
-    try:
+        from huggingface_hub import hf_hub_download
         from tokenization.vqvae_tokenizer import VQVAETokenizer
         from models.next_concept import NextConceptTransformer
+    except ImportError as e:
+        raise ImportError(
+            f"Missing dependencies for NCM inference: {e}. Ensure torch, huggingface_hub, omegaconf, and NCM are installed."
+        )
 
-        # Load tokenizer
-        if hasattr(cfg, "tokenizer"):
-            cfg.tokenizer.vqvae.checkpoint_path = tokenizer_path
-            tokenizer = VQVAETokenizer.from_config(cfg.tokenizer)
-        else:
-            tok_ckpt = torch.load(tokenizer_path, map_location=device, weights_only=False)
-            tokenizer = tok_ckpt
+    print(f"Loading NCM checkpoints from {repo_id}...")
+    subfolder = "xsum" if "checkpoints" in repo_id.lower() else None
+    config_path = hf_hub_download(repo_id=repo_id, filename="config.yaml", subfolder=subfolder)
+    tokenizer_path = hf_hub_download(repo_id=repo_id, filename="tokenizer.pt", subfolder=subfolder)
+    generator_path = hf_hub_download(repo_id=repo_id, filename="generator.pt", subfolder=subfolder)
 
-        # Load generator model
-        if hasattr(cfg, "model"):
-            model = NextConceptTransformer.from_config(cfg.model)
-            model_ckpt = torch.load(generator_path, map_location=device, weights_only=False)
-            state_dict = model_ckpt.get("state_dict", model_ckpt.get("model", model_ckpt))
-            model.load_state_dict(state_dict, strict=False)
-            model.to(device)
-            model.eval()
-    except Exception as err:
-        print(f"Notice: Direct HazyResearch class import deferred: {err}")
-        # Raw checkpoint load fallback
-        tokenizer = torch.load(tokenizer_path, map_location=device, weights_only=False)
-        model = torch.load(generator_path, map_location=device, weights_only=False)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    CFG = OmegaConf.load(config_path)
+
+    # eval_shard.py:48-59 exact loading
+    CFG.tokenizer.vqvae.checkpoint_path = tokenizer_path
+    tk = VQVAETokenizer.from_config(CFG.tokenizer)
+    tk.vqvae = tk.vqvae.to(device).eval()
+
+    net = NextConceptTransformer(vqvae_local=tk.vqvae, config=CFG.model).to(device)
+    sd = torch.load(generator_path, map_location="cpu", weights_only=False)
+    net.load_state_dict(sd["model"], strict=True)
+    net.eval()
 
     _LOADED_NCM = {
-        "cfg": cfg,
-        "tokenizer": tokenizer,
-        "model": model,
+        "tk": tk,
+        "net": net,
+        "cfg": CFG,
         "device": device,
-        "tokenizer_path": tokenizer_path,
-        "generator_path": generator_path,
     }
     return _LOADED_NCM
 
+
 def generate_skeleton_ncm(prompt: str, level_k: int, ncm_bundle: dict) -> str:
     """
-    Runs coarse-to-fine hierarchy generation stopping at coarse hierarchy level k.
-    Decodes the intermediate code hierarchy up to level_k into an early skeleton sketch.
+    Generates NCM coarse skeleton using exact eval_shard.py prefix encoding,
+    net.generate with stop_level=level_k, and tk.vqvae.decoder.
     """
-    import torch
-
-    model = ncm_bundle.get("model")
-    tokenizer = ncm_bundle.get("tokenizer")
+    tk = ncm_bundle["tk"]
+    net = ncm_bundle["net"]
+    cfg = ncm_bundle["cfg"]
     device = ncm_bundle["device"]
 
-    # If full NextConceptTransformer & VQVAETokenizer are active
-    if model is not None and hasattr(model, "generate") and hasattr(tokenizer, "encode"):
-        try:
-            with torch.no_grad():
-                # Tokenize prompt conditioning prefix
-                inputs = tokenizer.encode(prompt).to(device)
-                if inputs.dim() == 1:
-                    inputs = inputs.unsqueeze(0)
+    pt = tk.pre_tokenizer
+    P = int(cfg.model.prefix_len)
+    PAD = pt.pad_token_id
+    EOS = pt.eos_token_id
 
-                # NCM parallel generation truncated at level_k
-                # level_k specifies the coarse scale depth (levels 2..3)
-                outputs = model.generate(
-                    prefix_tokens=inputs,
-                    max_levels=level_k,
-                )
+    # Correct prefix construction (eval_shard.py:90-99)
+    ids = pt.encode(prompt)[:P]
+    x = torch.tensor([ids + [PAD] * (P - len(ids))], dtype=torch.long, device=device)
 
-                # Decode intermediate code stack up to level_k
-                if hasattr(tokenizer, "decode_multiscales"):
-                    decoded_stages = tokenizer.decode_multiscales(outputs)
-                    skeleton_text = decoded_stages.get(level_k, decoded_stages.get(len(decoded_stages) - 1, ""))
-                elif hasattr(tokenizer, "decode"):
-                    skeleton_text = tokenizer.decode(outputs)
-                else:
-                    skeleton_text = str(outputs)
+    # Correct generate call with stop_level (eval_shard.py:160-166 + next_concept.py:539-581)
+    with torch.no_grad():
+        _, latent = net.generate(
+            None,
+            x,
+            temperature=float(cfg.generation.temperature),
+            top_k=int(cfg.generation.top_k),
+            top_p=float(cfg.generation.top_p),
+            use_kv_cache=True,
+            cfg_scale=float(cfg.generation.cfg_scale),
+            cfg_null_eos=EOS,
+            return_latent=True,
+            stop_level=level_k,
+        )
 
-                if skeleton_text and skeleton_text.strip():
-                    return skeleton_text.strip()
-        except Exception as e:
-            print(f"Warning: Model forward pass returned error: {e}. Falling back to checkpoint decoding.")
+        # Correct decoding (eval_shard.py:102-105 + eval_shard.py:166)
+        # argmax in place of pick_tokens for smoke test (TODO: port pick_tokens in follow-up)
+        logits = tk.vqvae.decoder(latent)
+        output_ids = logits.argmax(-1)[0].tolist()
+        text = pt.decode(output_ids, skip_special_tokens=True).strip()
 
-    # Generic VQ codebook / latent decoding fallback from loaded checkpoint
-    try:
-        if isinstance(tokenizer, dict) and "codebook" in tokenizer:
-            # Codebook vector projection
-            cb = tokenizer["codebook"]
-            emb = cb.get(f"level_{level_k}", cb.get("embeddings"))
-            return f"[NCM Checkpoint Coarse Level {level_k}] Extracted latent concept"
-    except Exception:
-        pass
+        if not text:
+            raise RuntimeError(f"NCM generator returned empty decoding at level {level_k}")
 
-    # Clean representation if weights format is non-standard
-    return f"[NCM L{level_k}] Concept sketch for: {prompt[:40]}..."
+        return text
+
 
 def run_ncm_generation(
     seed_path: str = "seed.jsonl",
@@ -181,7 +209,6 @@ def run_ncm_generation(
     out_p = Path(output_path)
     out_p.parent.mkdir(parents=True, exist_ok=True)
 
-    # If --skeletons-in is provided, copy/merge to skip GPU inference work
     if skeletons_in:
         in_p = Path(skeletons_in)
         if not in_p.exists():
@@ -190,7 +217,6 @@ def run_ncm_generation(
         shutil.copy(in_p, out_p)
         return
 
-    # Check NCM Hugging Face Repo ID rule
     if not mock:
         if not NCM_XSUM_REPO:
             raise EnvironmentError(
@@ -254,6 +280,7 @@ def run_ncm_generation(
 
     print(f"Stage 1 complete. Generated {count} skeletons. Total in {output_path}: {len(processed_keys)}")
 
+
 def main():
     parser = argparse.ArgumentParser(description="Stage 1: NCM Skeleton Generation.")
     parser.add_argument("--seed-in", default="seed.jsonl", help="Input seed file path")
@@ -270,6 +297,7 @@ def main():
         limit=args.limit,
         mock=args.mock,
     )
+
 
 if __name__ == "__main__":
     main()
