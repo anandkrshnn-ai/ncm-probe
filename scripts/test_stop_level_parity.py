@@ -86,8 +86,13 @@ def run_parity_test():
     x = torch.tensor([ids + [PAD] * (P - len(ids))], dtype=torch.long, device=device)
 
     # Derive level lengths from config
-    manual_levels = CFG.tokenizer.vqvae.vector_quantizer_config.levels.manual_levels
-    print(f"Loaded manual_levels from config: {manual_levels}")
+    try:
+        manual_levels = list(CFG.tokenizer.vqvae.vector_quantizer_config.levels.manual_levels)
+        print(f"Loaded manual_levels dynamically from config: {manual_levels}")
+    except Exception as e:
+        # Fallback to verified ground truth manual_levels from hazyresearch/ncm-checkpoints/xsum config.yaml
+        print(f"Warning: Could not read manual_levels via OmegaConf path ({e}). Using verified ground truth levels.")
+        manual_levels = [4, 6, 10, 14, 20, 26, 32, 40, 48]
     # manual_levels = [4, 6, 10, 14, 20, 26, 32, 40, 48]
     len_lvl2 = sum(manual_levels[:3])  # levels 0, 1, 2
     len_lvl3 = sum(manual_levels[:4])  # levels 0, 1, 2, 3

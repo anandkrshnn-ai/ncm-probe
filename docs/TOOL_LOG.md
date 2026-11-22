@@ -11,3 +11,6 @@ The lesson is not that either agent was unreliable — it is that **in a two-age
 - `overall_metrics` provides the full structured metrics across all slices and buckets.
 - `classification_breakdown` is initialized with all 5 canonical research taxonomy keys (`success`, `tokenizer_failure`, `decoder_failure`, `over_trigger`, `rare_case`) to guarantee fixed schema stability for downstream evaluation scripts and notebooks.
 
+## Cross-Check & Ground-Truth Verification
+The two-tool workflow produced its first cross-check failure on this round: Replit's reference arithmetic for the level counts (18 and 30) was wrong, and Antigravity's config-derived values (20 and 34) were right. The error was caught because both tools were made to justify their numbers against a verifiable artifact — the config YAML. **The workflow is not "one tool writes, one tool reviews." It is "two tools produce claims, and every claim is checked against ground truth."** Both tools made errors across this project. Both tools were caught by the other's verification. The finding is not that either is unreliable; it is that any single-source claim in a research pipeline is unreliable until it is cross-checked against an external artifact.
+
