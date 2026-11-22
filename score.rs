@@ -60,26 +60,34 @@ pub struct LogRecord {
     pub planner_only: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum Classification {
+    Success,
+    TokenizerFailure,
+    DecoderFailure,
+    OverTrigger,
+    RareCase,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct BucketStats {
+pub struct SliceMetrics {
     pub total: usize,
-    pub entity_preserved_count: usize,
-    pub lookup_needed_count: usize,
-    pub entity_matched_count: usize,
+    pub success_count: usize,
+    pub tokenizer_failure_count: usize,
+    pub decoder_failure_count: usize,
+    pub over_trigger_count: usize,
+    pub rare_case_count: usize,
+    pub recovery_rate: f64,
     pub query_token_overlap_avg: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ScoreReport {
     /// Flattened key "{level_k}__{wrapper_variant}" to preserve JSON serialization compatibility.
-    pub slice_metrics: HashMap<String, HashMap<u8, BucketStats>>,
-    pub overall_stats: BucketStats,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct RateReport {
-    /// Flattened key "{level_k}__{wrapper_variant}" to preserve JSON serialization compatibility.
-    pub rates_by_slice: HashMap<String, f64>,
+    pub slice_metrics: HashMap<String, HashMap<u8, SliceMetrics>>,
+    pub overall_metrics: SliceMetrics,
+    pub classification_breakdown: HashMap<String, usize>,
     pub overall_recovery_rate: f64,
 }
 
@@ -88,46 +96,75 @@ pub fn make_slice_key(level_k: u8, wrapper: &str) -> String {
     format!("{level_k}__{wrapper}")
 }
 
-/// Normalizes month names (e.g., "Nov" -> "november") to prevent false negatives
-/// when comparing abbreviations with full month names across gold and extracted text.
-pub fn normalize_months(text: &str) -> String {
+fn month_name(mm: &str) -> &str {
+    match mm {
+        "01" | "1" | "jan" | "january" => "january",
+        "02" | "2" | "feb" | "february" => "february",
+        "03" | "3" | "mar" | "march" => "march",
+        "04" | "4" | "apr" | "april" => "april",
+        "05" | "5" | "may" => "may",
+        "06" | "6" | "jun" | "june" => "june",
+        "07" | "7" | "jul" | "july" => "july",
+        "08" | "8" | "aug" | "august" => "august",
+        "09" | "9" | "sep" | "sept" | "september" => "september",
+        "10" | "oct" | "october" => "october",
+        "11" | "nov" | "november" => "november",
+        "12" | "dec" | "december" => "december",
+        other => other,
+    }
+}
+
+/// Normalizes dates (e.g. YYYY-MM-DD -> YYYY month DD) and month names
+pub fn normalize_and_expand_dates(text: &str) -> String {
     let lower = text.to_lowercase();
-    let words: Vec<&str> = lower.split_whitespace().collect();
+    let chars: Vec<char> = lower.chars().collect();
+    let mut expanded = String::new();
+    let mut i = 0;
+
+    // Expand YYYY-MM-DD
+    while i < chars.len() {
+        if i + 10 <= chars.len()
+            && chars[i..i + 4].iter().all(|c| c.is_ascii_digit())
+            && chars[i + 4] == '-'
+            && chars[i + 5..i + 7].iter().all(|c| c.is_ascii_digit())
+            && chars[i + 7] == '-'
+            && chars[i + 8..i + 10].iter().all(|c| c.is_ascii_digit())
+        {
+            let y: String = chars[i..i + 4].iter().collect();
+            let m: String = chars[i + 5..i + 7].iter().collect();
+            let d_str: String = chars[i + 8..i + 10].iter().collect();
+            let d = d_str.trim_start_matches('0');
+            let m_name = month_name(&m);
+            expanded.push_str(&format!("{} {} {} ", y, m_name, d));
+            i += 10;
+        } else {
+            expanded.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    let words: Vec<&str> = expanded.split_whitespace().collect();
     let mut mapped = Vec::new();
     for w in words {
         let trimmed = w.trim_matches(|c: char| !c.is_alphanumeric());
-        let norm = match trimmed {
-            "jan" | "january" => "january",
-            "feb" | "february" => "february",
-            "mar" | "march" => "march",
-            "apr" | "april" => "april",
-            "may" => "may",
-            "jun" | "june" => "june",
-            "jul" | "july" => "july",
-            "aug" | "august" => "august",
-            "sep" | "sept" | "september" => "september",
-            "oct" | "october" => "october",
-            "nov" | "november" => "november",
-            "dec" | "december" => "december",
-            _ => w,
-        };
-        mapped.push(norm.to_string());
+        mapped.push(month_name(trimmed).to_string());
     }
     mapped.join(" ")
 }
 
 pub fn tokenize_clean(text: &str) -> HashSet<String> {
     let stopset: HashSet<&str> = STOPWORDS.iter().cloned().collect();
-    let normalized = normalize_months(text);
+    let normalized = normalize_and_expand_dates(text);
     normalized
-        .split(|c: char| !c.is_alphanumeric() && c != '-')
+        .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
         .map(|t| t.to_lowercase())
         .filter(|t| !stopset.contains(t.as_str()))
         .collect()
 }
 
-/// Token-set recall approach with normalized months to handle "Nov 14" vs "November 14".
+/// Token-set recall approach.
+/// Checks if text_to_check contains the entity tokens from gold_entity.
 pub fn entity_match(gold_entity: &str, text_to_check: &str) -> bool {
     let gold_tokens = tokenize_clean(gold_entity);
     if gold_tokens.is_empty() {
@@ -157,16 +194,38 @@ pub fn calculate_query_overlap(gold_query: &str, query: &str) -> f64 {
     intersection as f64 / gold_tokens.len() as f64
 }
 
-pub fn score_file(path: &Path) -> Result<(ScoreReport, RateReport), Box<dyn std::error::Error>> {
+/// Evaluates row into one of five mutually exclusive research categories:
+/// - Success: Entity successfully recovered in query/skeleton and correctly routed.
+/// - TokenizerFailure: NCM skeleton corrupted or produced wrong entity.
+/// - DecoderFailure: Skeleton preserved entity, but extractor failed to produce a valid query matching the entity.
+/// - OverTrigger: Question did not require external lookup (static fact), but pipeline triggered search anyway.
+/// - RareCase: Expected external lookup, but pipeline failed to trigger search.
+pub fn classify_record(entry: &LogRecord) -> Classification {
+    let expected_lookup = entry.expected_needs_lookup;
+    let predicted_lookup = entry.extractor_json.needs_lookup;
+    let query_matched = entity_match(&entry.gold_entity, &entry.extractor_json.query);
+    let skeleton_matched = entity_match(&entry.gold_entity, &entry.skeleton_text);
+    let entity_preserved = entry.extractor_json.entity_preserved;
+
+    if !expected_lookup && predicted_lookup {
+        Classification::OverTrigger
+    } else if expected_lookup && !predicted_lookup {
+        Classification::RareCase
+    } else if !skeleton_matched && !entity_preserved {
+        Classification::TokenizerFailure
+    } else if (skeleton_matched || entity_preserved) && !query_matched {
+        Classification::DecoderFailure
+    } else {
+        Classification::Success
+    }
+}
+
+pub fn score_file(path: &Path) -> Result<ScoreReport, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
 
     let mut report = ScoreReport::default();
-    let mut rate_report = RateReport::default();
-
-    let mut slice_tallies: HashMap<String, (usize, usize)> = HashMap::new();
-    let mut total_count = 0;
-    let mut total_recovered = 0;
+    let mut total_success = 0;
 
     for (line_idx, line) in reader.lines().enumerate() {
         let line_content = line?;
@@ -183,72 +242,88 @@ pub fn score_file(path: &Path) -> Result<(ScoreReport, RateReport), Box<dyn std:
             }
         };
 
+        let classification = classify_record(&entry);
+        let class_name = match classification {
+            Classification::Success => "success",
+            Classification::TokenizerFailure => "tokenizer_failure",
+            Classification::DecoderFailure => "decoder_failure",
+            Classification::OverTrigger => "over_trigger",
+            Classification::RareCase => "rare_case",
+        };
+
+        *report
+            .classification_breakdown
+            .entry(class_name.to_string())
+            .or_insert(0) += 1;
+
         let slice_key = make_slice_key(entry.level_k, &entry.wrapper_variant);
         let bucket = entry.bucket;
 
         let bucket_stat = report
             .slice_metrics
-            .entry(slice_key.clone())
+            .entry(slice_key)
             .or_default()
             .entry(bucket)
             .or_default();
 
         bucket_stat.total += 1;
-        report.overall_stats.total += 1;
+        report.overall_metrics.total += 1;
 
-        if entry.extractor_json.entity_preserved {
-            bucket_stat.entity_preserved_count += 1;
-            report.overall_stats.entity_preserved_count += 1;
-        }
-
-        if entry.extractor_json.needs_lookup {
-            bucket_stat.lookup_needed_count += 1;
-            report.overall_stats.lookup_needed_count += 1;
-        }
-
-        let final_ans = entry.final_answer.as_deref().unwrap_or("");
-        let is_matched = entity_match(&entry.gold_entity, &entry.extractor_json.query)
-            || entity_match(&entry.gold_entity, &entry.skeleton_text)
-            || entity_match(&entry.gold_entity, final_ans);
-
-        if is_matched {
-            bucket_stat.entity_matched_count += 1;
-            report.overall_stats.entity_matched_count += 1;
+        match classification {
+            Classification::Success => {
+                bucket_stat.success_count += 1;
+                report.overall_metrics.success_count += 1;
+                total_success += 1;
+            }
+            Classification::TokenizerFailure => {
+                bucket_stat.tokenizer_failure_count += 1;
+                report.overall_metrics.tokenizer_failure_count += 1;
+            }
+            Classification::DecoderFailure => {
+                bucket_stat.decoder_failure_count += 1;
+                report.overall_metrics.decoder_failure_count += 1;
+            }
+            Classification::OverTrigger => {
+                bucket_stat.over_trigger_count += 1;
+                report.overall_metrics.over_trigger_count += 1;
+            }
+            Classification::RareCase => {
+                bucket_stat.rare_case_count += 1;
+                report.overall_metrics.rare_case_count += 1;
+            }
         }
 
         let overlap = calculate_query_overlap(&entry.gold_query, &entry.extractor_json.query);
         bucket_stat.query_token_overlap_avg += overlap;
-        report.overall_stats.query_token_overlap_avg += overlap;
+        report.overall_metrics.query_token_overlap_avg += overlap;
+    }
 
-        let tally = slice_tallies.entry(slice_key).or_insert((0, 0));
-        tally.0 += 1;
-        total_count += 1;
-        if is_matched || entry.extractor_json.entity_preserved {
-            tally.1 += 1;
-            total_recovered += 1;
+    // Finalize slice recovery rates
+    for slice_map in report.slice_metrics.values_mut() {
+        for stat in slice_map.values_mut() {
+            if stat.total > 0 {
+                stat.recovery_rate = stat.success_count as f64 / stat.total as f64;
+                stat.query_token_overlap_avg /= stat.total as f64;
+            }
         }
     }
 
-    if report.overall_stats.total > 0 {
-        report.overall_stats.query_token_overlap_avg /= report.overall_stats.total as f64;
+    if report.overall_metrics.total > 0 {
+        report.overall_metrics.query_token_overlap_avg /= report.overall_metrics.total as f64;
+        report.overall_metrics.recovery_rate =
+            total_success as f64 / report.overall_metrics.total as f64;
+        report.overall_recovery_rate = report.overall_metrics.recovery_rate;
     }
 
-    for (slice_k, (count, recovered)) in slice_tallies {
-        let rate = if count > 0 {
-            recovered as f64 / count as f64
-        } else {
-            0.0
-        };
-        rate_report.rates_by_slice.insert(slice_k, rate);
-    }
+    Ok(report)
+}
 
-    rate_report.overall_recovery_rate = if total_count > 0 {
-        total_recovered as f64 / total_count as f64
-    } else {
-        0.0
-    };
-
-    Ok((report, rate_report))
+fn print_help() {
+    println!("ncm-probe scorer");
+    println!("Usage: score [OPTIONS]");
+    println!("\nOptions:");
+    println!("  --input <PATH>   Path to JSONL execution logs to score (default: logs/logs.jsonl)");
+    println!("  -h, --help       Print this help message");
 }
 
 fn main() {
@@ -257,7 +332,10 @@ fn main() {
 
     let mut i = 1;
     while i < args.len() {
-        if args[i] == "--input" && i + 1 < args.len() {
+        if args[i] == "-h" || args[i] == "--help" {
+            print_help();
+            return;
+        } else if args[i] == "--input" && i + 1 < args.len() {
             input_path = &args[i + 1];
             i += 1;
         } else if !args[i].starts_with('-') {
@@ -267,13 +345,9 @@ fn main() {
     }
 
     let target_path = Path::new(input_path);
-    println!("Scoring file: {:?}", target_path);
     match score_file(target_path) {
-        Ok((score_rep, rate_rep)) => {
-            println!("\n=== Score Report ===");
-            println!("{}", serde_json::to_string_pretty(&score_rep).unwrap());
-            println!("\n=== Rate Report ===");
-            println!("{}", serde_json::to_string_pretty(&rate_rep).unwrap());
+        Ok(report) => {
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
         }
         Err(e) => {
             eprintln!("Scorer failed: {}", e);
