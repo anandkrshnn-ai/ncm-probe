@@ -221,6 +221,7 @@ def run_ncm_generation(
     skeletons_in: str | None = None,
     limit: int | None = None,
     mock: bool = False,
+    level_k: int | None = None,
 ) -> None:
     out_p = Path(output_path)
     out_p.parent.mkdir(parents=True, exist_ok=True)
@@ -234,17 +235,14 @@ def run_ncm_generation(
         return
 
     if not mock:
-        if not NCM_XSUM_REPO:
-            raise EnvironmentError(
-                "CRITICAL: NCM_XSUM_REPO environment variable is unset or ambiguous!\n"
-                "Rule: 'Never guess the NCM Hugging Face repo ID. If ambiguous, halt and ask.'\n"
-                "Please configure NCM_XSUM_REPO (e.g. hazyresearch/ncm-checkpoints) or provide pre-generated skeletons with --skeletons-in."
-            )
-        ncm_bundle = get_ncm_generator(NCM_XSUM_REPO)
+        repo_id = NCM_XSUM_REPO or "hazyresearch/ncm-checkpoints"
+        ncm_bundle = get_ncm_generator(repo_id)
     else:
         ncm_bundle = None
 
     rows = validate_seed(seed_path)
+
+    target_levels = [level_k] if level_k is not None else LEVEL_KEYS
 
     processed_keys = set()
     if out_p.exists():
@@ -263,7 +261,7 @@ def run_ncm_generation(
         for row in rows:
             row_id = str(row["id"])
             for wrapper in WRAPPER_VARIANTS:
-                for lvl in LEVEL_KEYS:
+                for lvl in target_levels:
                     comp_key = make_composite_key(row_id, wrapper, lvl)
                     if comp_key in processed_keys:
                         continue
@@ -303,6 +301,7 @@ def main():
     parser.add_argument("--output", default="logs/skeletons.jsonl", help="Output skeletons JSONL path")
     parser.add_argument("--skeletons-in", default=None, help="Pre-computed skeletons file to skip GPU work")
     parser.add_argument("--limit", type=int, default=None, help="Maximum number of skeletons to generate")
+    parser.add_argument("--level_k", type=int, default=None, help="Specific level_k to generate (e.g. 2 or 3)")
     parser.add_argument("--mock", action="store_true", help="Run with mock generator for local testing")
     args = parser.parse_args()
 
@@ -312,6 +311,7 @@ def main():
         skeletons_in=args.skeletons_in,
         limit=args.limit,
         mock=args.mock,
+        level_k=args.level_k,
     )
 
 
