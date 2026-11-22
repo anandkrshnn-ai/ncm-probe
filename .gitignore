@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*$py.class
+target/
+Cargo.lock
+logs/*.jsonl
+!logs/.gitkeep
+analysis/*.jsonl
+!analysis/.gitkeep
+.env

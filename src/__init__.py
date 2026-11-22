@@ -1,0 +1,3 @@
+"""
+ncm-probe package initialization.
+"""
