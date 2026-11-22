@@ -17,6 +17,7 @@ levels: [4, 6, 10, 14, 20, 26, 32, 40, 48] (9 levels total)
 
 import os
 import sys
+import inspect
 from pathlib import Path
 import torch
 from omegaconf import OmegaConf
@@ -25,9 +26,6 @@ from huggingface_hub import hf_hub_download
 # Add repo root to path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
-
-# Import monkeypatch to ensure patched_generate is defined and applied
-from src.ncm_generate import patch_next_concept_generate
 
 # Fixed real XSum example paragraph (source: BBC News / XSum test split sample)
 FIXED_XSUM_DOC = (
@@ -58,6 +56,17 @@ def run_parity_test():
     from tokenization.vqvae_tokenizer import VQVAETokenizer
     from models.next_concept import NextConceptTransformer
 
+    # Step 1: Capture TRUE upstream generate BEFORE any monkeypatch is applied
+    true_orig_generate = NextConceptTransformer.generate
+    assert "stop_level" not in inspect.signature(true_orig_generate).parameters, (
+        f"Captured generate() is already patched: {inspect.signature(true_orig_generate)}"
+    )
+
+    # Step 2: Apply patch via apply_ncm_patch
+    from src.ncm_generate import apply_ncm_patch
+    apply_ncm_patch()
+    patched_generate = NextConceptTransformer.generate
+
     CFG.tokenizer.vqvae.checkpoint_path = tokenizer_path
     tk = VQVAETokenizer.from_config(CFG.tokenizer)
     tk.vqvae = tk.vqvae.cuda().eval()
@@ -66,11 +75,6 @@ def run_parity_test():
     sd = torch.load(generator_path, map_location="cpu", weights_only=False)
     net.load_state_dict(sd["model"], strict=True)
     net.eval()
-
-    # Capture original generate before monkeypatch
-    orig_generate = NextConceptTransformer.generate
-    # Apply surgical monkeypatch
-    patched_generate = patch_next_concept_generate(orig_generate)
 
     # Prefix construction per eval_shard.py:90-99
     pt = tk.pre_tokenizer
@@ -94,7 +98,7 @@ def run_parity_test():
     print("\n--- Test 1: Parity at stop_level=None ---")
     torch.manual_seed(42)
     with torch.no_grad():
-        out_orig, latent_orig = orig_generate(
+        out_orig, latent_orig = true_orig_generate(
             net, None, x, temperature=0.0, top_k=1, top_p=0.0,
             use_kv_cache=True, cfg_scale=0.0, cfg_null_eos=EOS, return_latent=True
         )

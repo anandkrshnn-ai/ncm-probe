@@ -85,13 +85,26 @@ def patch_next_concept_generate(orig_generate_fn):
     return functools.wraps(orig_generate_fn)(patched_fn)
 
 
-# Apply monkeypatch at import time if models.next_concept is available
-try:
-    from models.next_concept import NextConceptTransformer
-    NextConceptTransformer.generate = patch_next_concept_generate(NextConceptTransformer.generate)
-except Exception:
-    # Environment without HazyResearch/ncm installed yet (e.g. authoring environment)
-    pass
+_ncm_patch_applied = False
+
+
+def apply_ncm_patch():
+    """
+    Applies the surgical stop_level patch to NextConceptTransformer.generate.
+    Safe to call multiple times (idempotent).
+    """
+    global _ncm_patch_applied
+    if _ncm_patch_applied:
+        return
+    try:
+        from models.next_concept import NextConceptTransformer
+        NextConceptTransformer.generate = patch_next_concept_generate(
+            NextConceptTransformer.generate
+        )
+        _ncm_patch_applied = True
+    except Exception as e:
+        # If models.next_concept cannot be imported, re-raise or let caller handle
+        raise e
 
 
 def make_composite_key(row_id: str, wrapper_variant: str, level_k: int) -> str:
@@ -124,6 +137,9 @@ def get_ncm_generator(repo_id: str):
         raise ImportError(
             f"Missing dependencies for NCM inference: {e}. Ensure torch, huggingface_hub, omegaconf, and NCM are installed."
         )
+
+    # Ensure the surgical stop_level patch is applied to NextConceptTransformer.generate
+    apply_ncm_patch()
 
     print(f"Loading NCM checkpoints from {repo_id}...")
     subfolder = "xsum" if "checkpoints" in repo_id.lower() else None
