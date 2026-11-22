@@ -15,6 +15,7 @@ Enforces all research constraints and schema rules:
   {planet, element, country, state, USA, Florida, band, company}.
 """
 
+import argparse
 import json
 import re
 import sys
@@ -43,7 +44,7 @@ DISAMBIGUATORS = {
 }
 
 
-def validate_seed(file_path: Path | str) -> list[dict]:
+def validate_seed(file_path: Path | str, limit: int | None = None) -> list[dict]:
     path = Path(file_path)
     if not path.exists():
         raise FileNotFoundError(f"Seed file not found: {path}")
@@ -100,7 +101,6 @@ def validate_seed(file_path: Path | str) -> list[dict]:
 
             # Rule 3: Bucket 5 gold_entity MUST contain a disambiguator token
             if bucket == 5:
-                # Token-level or substring check matching disambiguators
                 tokens = set(re.findall(r"\b\w+\b", gold_entity))
                 if not any(d in tokens or d in gold_entity for d in DISAMBIGUATORS):
                     raise ValueError(
@@ -108,22 +108,36 @@ def validate_seed(file_path: Path | str) -> list[dict]:
                     )
 
             rows.append(data)
+            if limit is not None and len(rows) >= limit:
+                break
 
-    if len(rows) != 100:
-        raise ValueError(f"Expected exactly 100 rows, found {len(rows)}")
+    # If full validation (no sub-limit)
+    if limit is None or limit == 100:
+        if len(rows) != 100:
+            raise ValueError(f"Expected exactly 100 rows, found {len(rows)}")
 
-    for b, count in bucket_counts.items():
-        if count != 20:
-            raise ValueError(f"Expected exactly 20 rows in bucket {b}, found {count}")
+        for b, count in bucket_counts.items():
+            if count != 20:
+                raise ValueError(f"Expected exactly 20 rows in bucket {b}, found {count}")
 
-    print(f"Validation successful! Verified 100 rows across 5 buckets (20 each) in '{path}'.")
+    print(f"Validation successful! Verified {len(rows)} rows in '{path}'.")
     return rows
 
 
-if __name__ == "__main__":
-    target = sys.argv[1] if len(sys.argv) > 1 else "seed.jsonl"
+def main():
+    parser = argparse.ArgumentParser(description="Validate seed JSONL file constraints.")
+    parser.add_argument("--input", default="seed.jsonl", help="Path to seed JSONL file")
+    parser.add_argument("--limit", type=int, default=None, help="Optional limit for validation")
+    parser.add_argument("pos_input", nargs="?", default=None, help="Positional path fallback")
+    args = parser.parse_args()
+
+    target = args.pos_input if args.pos_input else args.input
     try:
-        validate_seed(target)
+        validate_seed(target, limit=args.limit)
     except Exception as e:
         print(f"Validation ERROR: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

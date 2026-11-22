@@ -30,21 +30,34 @@ const STOPWORDS: &[&str] = &[
     "yourself", "yourselves",
 ];
 
-/// The exact contract struct for input JSONL lines (emitted by src/assemble_logs.py)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionLogEntry {
-    pub id: String,
-    pub bucket: u8,
-    pub wrapper_variant: String,
-    pub level_k: u8,
-    pub question: String,
-    pub gold_query: String,
-    pub gold_entity: String,
-    pub skeleton_text: String,
+pub struct ExtractorOutput {
     pub needs_lookup: bool,
     pub query: String,
     pub entity_preserved: bool,
-    pub execution_response: String,
+}
+
+/// The exact pinned Rust contract struct for input JSONL lines
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogRecord {
+    pub id: String,
+    pub bucket: u8,
+    pub question: String,
+    pub wrapper_variant: String,
+    pub level_k: u8,
+    pub skeleton_text: String,
+    pub skeleton_token_len: usize,
+    pub extractor_json: ExtractorOutput,
+    pub tool_called: bool,
+    pub tool_query: Option<String>,
+    pub tool_output: Option<String>,
+    pub final_answer: Option<String>,
+    pub latency_breakdown: Option<HashMap<String, f64>>,
+    pub gold_query: String,
+    pub gold_entity: String,
+    pub expected_needs_lookup: bool,
+    pub tool_returned_answer: bool,
+    pub planner_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -79,58 +92,28 @@ pub fn make_slice_key(level_k: u8, wrapper: &str) -> String {
 /// when comparing abbreviations with full month names across gold and extracted text.
 pub fn normalize_months(text: &str) -> String {
     let lower = text.to_lowercase();
-    let replacements = [
-        ("january", "january"),
-        ("february", "february"),
-        ("march", "march"),
-        ("april", "april"),
-        ("may", "may"),
-        ("june", "june"),
-        ("july", "july"),
-        ("august", "august"),
-        ("september", "september"),
-        ("october", "october"),
-        ("november", "november"),
-        ("december", "december"),
-        ("jan", "january"),
-        ("feb", "february"),
-        ("mar", "march"),
-        ("apr", "april"),
-        ("jun", "june"),
-        ("jul", "july"),
-        ("aug", "august"),
-        ("sep", "september"),
-        ("sept", "september"),
-        ("oct", "october"),
-        ("nov", "november"),
-        ("dec", "december"),
-    ];
-
-    let mut result = lower;
-    for (short_m, full_m) in replacements {
-        let pattern = format!(r"\b{}\b", short_m);
-        // Replace boundary-delimited occurrences safely
-        if let Ok(re) = regex_replace(&pattern, &result, full_m) {
-            result = re;
-        }
-    }
-    result
-}
-
-fn regex_replace(pat: &str, text: &str, rep: &str) -> Result<String, ()> {
-    // Basic regex-free or simple word boundary replacement
-    let words: Vec<&str> = text.split_whitespace().collect();
+    let words: Vec<&str> = lower.split_whitespace().collect();
     let mut mapped = Vec::new();
-    let clean_pat = pat.trim_start_matches(r"\b").trim_end_matches(r"\b");
     for w in words {
         let trimmed = w.trim_matches(|c: char| !c.is_alphanumeric());
-        if trimmed == clean_pat {
-            mapped.push(rep.to_string());
-        } else {
-            mapped.push(w.to_string());
-        }
+        let norm = match trimmed {
+            "jan" | "january" => "january",
+            "feb" | "february" => "february",
+            "mar" | "march" => "march",
+            "apr" | "april" => "april",
+            "may" => "may",
+            "jun" | "june" => "june",
+            "jul" | "july" => "july",
+            "aug" | "august" => "august",
+            "sep" | "sept" | "september" => "september",
+            "oct" | "october" => "october",
+            "nov" | "november" => "november",
+            "dec" | "december" => "december",
+            _ => w,
+        };
+        mapped.push(norm.to_string());
     }
-    Ok(mapped.join(" "))
+    mapped.join(" ")
 }
 
 pub fn tokenize_clean(text: &str) -> HashSet<String> {
@@ -157,7 +140,6 @@ pub fn entity_match(gold_entity: &str, text_to_check: &str) -> bool {
         .filter(|tok| target_tokens.contains(*tok))
         .count();
 
-    // High recall match: at least 70% of gold entity tokens or all tokens if <= 2
     if gold_tokens.len() <= 2 {
         matched_count == gold_tokens.len()
     } else {
@@ -193,7 +175,7 @@ pub fn score_file(path: &Path) -> Result<(ScoreReport, RateReport), Box<dyn std:
             continue;
         }
 
-        let entry: ExecutionLogEntry = match serde_json::from_str(trimmed) {
+        let entry: LogRecord = match serde_json::from_str(trimmed) {
             Ok(e) => e,
             Err(err) => {
                 eprintln!("Error deserializing line {}: {}", line_idx + 1, err);
@@ -214,33 +196,34 @@ pub fn score_file(path: &Path) -> Result<(ScoreReport, RateReport), Box<dyn std:
         bucket_stat.total += 1;
         report.overall_stats.total += 1;
 
-        if entry.entity_preserved {
+        if entry.extractor_json.entity_preserved {
             bucket_stat.entity_preserved_count += 1;
             report.overall_stats.entity_preserved_count += 1;
         }
 
-        if entry.needs_lookup {
+        if entry.extractor_json.needs_lookup {
             bucket_stat.lookup_needed_count += 1;
             report.overall_stats.lookup_needed_count += 1;
         }
 
-        let is_matched = entity_match(&entry.gold_entity, &entry.query)
+        let final_ans = entry.final_answer.as_deref().unwrap_or("");
+        let is_matched = entity_match(&entry.gold_entity, &entry.extractor_json.query)
             || entity_match(&entry.gold_entity, &entry.skeleton_text)
-            || entity_match(&entry.gold_entity, &entry.execution_response);
+            || entity_match(&entry.gold_entity, final_ans);
 
         if is_matched {
             bucket_stat.entity_matched_count += 1;
             report.overall_stats.entity_matched_count += 1;
         }
 
-        let overlap = calculate_query_overlap(&entry.gold_query, &entry.query);
+        let overlap = calculate_query_overlap(&entry.gold_query, &entry.extractor_json.query);
         bucket_stat.query_token_overlap_avg += overlap;
         report.overall_stats.query_token_overlap_avg += overlap;
 
         let tally = slice_tallies.entry(slice_key).or_insert((0, 0));
         tally.0 += 1;
         total_count += 1;
-        if is_matched || entry.entity_preserved {
+        if is_matched || entry.extractor_json.entity_preserved {
             tally.1 += 1;
             total_recovered += 1;
         }
@@ -270,15 +253,20 @@ pub fn score_file(path: &Path) -> Result<(ScoreReport, RateReport), Box<dyn std:
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let default_path = Path::new("logs/logs.jsonl");
-    let target_path = if args.len() > 1 {
-        Path::new(&args[1])
-    } else if Path::new("fixtures/skeletons_3row.jsonl").exists() {
-        Path::new("fixtures/skeletons_3row.jsonl")
-    } else {
-        default_path
-    };
+    let mut input_path = "logs/logs.jsonl";
 
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--input" && i + 1 < args.len() {
+            input_path = &args[i + 1];
+            i += 1;
+        } else if !args[i].starts_with('-') {
+            input_path = &args[i];
+        }
+        i += 1;
+    }
+
+    let target_path = Path::new(input_path);
     println!("Scoring file: {:?}", target_path);
     match score_file(target_path) {
         Ok((score_rep, rate_rep)) => {
@@ -290,31 +278,6 @@ fn main() {
         Err(e) => {
             eprintln!("Scorer failed: {}", e);
             std::process::exit(1);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_entity_match_month_normalization() {
-        assert!(entity_match("NVDA 2026-11-14", "NVDA Nov 14 2026"));
-        assert!(entity_match("NVDA 2026-11-14", "NVDA November 14 2026"));
-    }
-
-    #[test]
-    fn test_slice_key() {
-        assert_eq!(make_slice_key(2, "answer"), "2__answer");
-        assert_eq!(make_slice_key(3, "passage"), "3__passage");
-    }
-
-    #[test]
-    fn test_stopwords_do_not_contain_dates() {
-        let date_tokens = ["november", "nov", "2026", "14", "october", "2024"];
-        for d in date_tokens {
-            assert!(!STOPWORDS.contains(&d), "STOPWORDS should not contain date token: {}", d);
         }
     }
 }

@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 Tavily search wrapper for ncm-probe.
 """
 
+import argparse
 import json
 import urllib.request
 import urllib.error
@@ -46,3 +47,17 @@ def search(query: str, max_results: int = 5) -> list[str]:
         raise RuntimeError(f"Tavily API HTTPError ({e.code}): {err_msg}")
     except Exception as e:
         raise RuntimeError(f"Tavily search request failed: {e}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Tavily search wrapper CLI.")
+    parser.add_argument("--query", default=None, help="Query string to search")
+    parser.add_argument("--limit", type=int, default=5, help="Maximum snippets to return")
+    args = parser.parse_args()
+
+    if args.query:
+        snippets = search(args.query, max_results=args.limit)
+        for i, s in enumerate(snippets, 1):
+            print(f"[{i}] {s}\n")
+
+if __name__ == "__main__":
+    main()

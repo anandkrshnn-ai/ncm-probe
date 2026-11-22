@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 OpenAI chat completion wrapper for ncm-probe.
 """
 
+import argparse
 import json
 import urllib.request
 import urllib.error
@@ -54,3 +55,16 @@ def chat(
         raise RuntimeError(f"OpenAI API HTTPError ({e.code}): {err_msg}")
     except Exception as e:
         raise RuntimeError(f"OpenAI chat request failed: {e}")
+
+def main():
+    parser = argparse.ArgumentParser(description="OpenAI chat wrapper CLI.")
+    parser.add_argument("--prompt", default=None, help="Prompt text to test")
+    parser.add_argument("--model", default="gpt-4o-mini", help="OpenAI model identifier")
+    args = parser.parse_args()
+
+    if args.prompt:
+        resp = chat([{"role": "user", "content": args.prompt}], model=args.model)
+        print(resp)
+
+if __name__ == "__main__":
+    main()

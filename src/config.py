@@ -3,6 +3,7 @@ Configuration module for ncm-probe.
 Reads required environment variables and fails fast with actionable errors.
 """
 
+import argparse
 import os
 import sys
 
@@ -45,3 +46,17 @@ def check_env_for_stage(stage_name: str) -> None:
     elif stage_name == "extract":
         if not OPENAI_API_KEY:
             raise EnvironmentError("OPENAI_API_KEY is required for LLM extractor operations.")
+
+def main():
+    parser = argparse.ArgumentParser(description="Configuration and environment inspector for ncm-probe.")
+    parser.add_argument("--check-stage", default=None, help="Check environment variables for a specific stage")
+    args = parser.parse_args()
+
+    if args.check_stage:
+        check_env_for_stage(args.check_stage)
+        print(f"Environment check passed for stage '{args.check_stage}'.")
+    else:
+        print("ncm-probe configuration module loaded.")
+
+if __name__ == "__main__":
+    main()
