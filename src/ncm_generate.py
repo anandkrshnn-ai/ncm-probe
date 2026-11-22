@@ -89,10 +89,14 @@ def patch_next_concept_generate(orig_generate_fn):
         "# last retained from stop_level\n"
     )
 
+    # Dedent source because inspect.getsourcelines() on a class method retains class-level indentation
+    import textwrap
+    dedented_source = textwrap.dedent(patched_source)
+
     # Compile the patched function with the original closure and globals
     fn_globals = orig_generate_fn.__globals__
     exec_scope = {}
-    exec(patched_source, fn_globals, exec_scope)
+    exec(dedented_source, fn_globals, exec_scope)
     patched_fn = exec_scope["generate"]
     return functools.wraps(orig_generate_fn)(patched_fn)
 
